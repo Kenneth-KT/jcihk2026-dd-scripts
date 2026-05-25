@@ -6,18 +6,41 @@ const readline = require("node:readline/promises");
 
 function printUsage() {
   console.log("Usage:");
+  console.log('  node download-drive-links.js "<link1>,<link2>,..." [folder-name]');
   console.log("  node download-drive-links.js");
   console.log("  # then paste comma-separated links when prompted");
   console.log("");
   console.log("Or pipe input:");
   console.log('  echo "<link1>,<link2>,<link3>" | node download-drive-links.js');
   console.log("");
-  console.log("Example:");
+  console.log("Examples:");
+  console.log(
+    '  node download-drive-links.js "https://drive.google.com/file/d/FILE_ID/view,https://drive.google.com/open?id=ANOTHER_ID" 01-BJC1',
+  );
   console.log(
     '  echo "https://drive.google.com/file/d/FILE_ID/view?usp=sharing,https://drive.google.com/open?id=ANOTHER_ID" | node download-drive-links.js',
   );
 }
 
+function safeDirName(name) {
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    throw new Error(`Invalid folder name: ${name}`);
+  }
+  return cleaned;
+}
+
+function parseCliArgs(argv) {
+  const args = argv.slice(2);
+  if (args.length === 0) {
+    return { links: null, folder: null };
+  }
+
+  return {
+    links: args[0],
+    folder: args[1] ?? null,
+  };
+}
 function getTimestampFolderName() {
   const now = new Date();
   const yyyy = now.getFullYear();
@@ -61,24 +84,38 @@ function safeFilename(name) {
   return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim() || "downloaded-file";
 }
 
+function decodeRfc5987Filename(value) {
+  try {
+    return decodeURIComponent(value.replace(/\+/g, " "));
+  } catch {
+    return value;
+  }
+}
+
+// HTTP headers are Latin-1; servers often put UTF-8 bytes in filename="...".
+function decodeLegacyFilename(value) {
+  return Buffer.from(value, "latin1").toString("utf8");
+}
+
 function resolveFilenameFromHeaders(headers, fallback) {
   const disposition = headers.get("content-disposition");
   if (!disposition) {
     return fallback;
   }
 
-  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf8Match && utf8Match[1]) {
-    try {
-      return safeFilename(decodeURIComponent(utf8Match[1]));
-    } catch {
-      return safeFilename(utf8Match[1]);
-    }
+  const utf8Match = disposition.match(/filename\*=(?:UTF-8|utf-8)''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return safeFilename(decodeRfc5987Filename(utf8Match[1].trim()));
   }
 
-  const basicMatch = disposition.match(/filename="?([^"]+)"?/i);
-  if (basicMatch && basicMatch[1]) {
-    return safeFilename(basicMatch[1]);
+  const quotedMatch = disposition.match(/filename="([^"]+)"/i);
+  if (quotedMatch?.[1]) {
+    return safeFilename(decodeLegacyFilename(quotedMatch[1]));
+  }
+
+  const unquotedMatch = disposition.match(/filename=([^;]+)/i);
+  if (unquotedMatch?.[1]) {
+    return safeFilename(decodeLegacyFilename(unquotedMatch[1].trim()));
   }
 
   return fallback;
@@ -153,7 +190,8 @@ async function readLinksInput() {
 }
 
 async function main() {
-  const rawInput = await readLinksInput();
+  const cli = parseCliArgs(process.argv);
+  const rawInput = cli.links ?? (await readLinksInput());
   if (!rawInput) {
     console.error("No input received.");
     printUsage();
@@ -168,7 +206,16 @@ async function main() {
     return;
   }
 
-  const outputDir = path.resolve(process.cwd(), getTimestampFolderName());
+  let folderName;
+  try {
+    folderName = cli.folder ? safeDirName(cli.folder) : getTimestampFolderName();
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+    return;
+  }
+
+  const outputDir = path.resolve(process.cwd(), folderName);
   await fs.mkdir(outputDir, { recursive: true });
 
   console.log(`Downloading ${links.length} file(s) into: ${outputDir}`);
