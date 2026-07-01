@@ -1,0 +1,18 @@
+{
+  "name": "jvc-ei-reports",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "report": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "lodash": "^4.17.21",
+    "nodemailer": "^6.10.0",
+    "officecrypto-tool": "^0.0.19",
+    "papaparse": "^5.5.3",
+    "xlsx": "^0.18.5"
+  }
+}
