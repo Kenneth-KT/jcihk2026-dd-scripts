@@ -5,26 +5,29 @@
  *
  * Usage:
  *   node generate-newsletter.js
- *   → Open newsletter-may-2026.js
+ *   → Open generated JS file
  *   → Copy contents
  *   → Open Mailchimp editor in browser
  *   → Paste into DevTools Console → Enter
+ *
+ * When split into N emails, N fetch snippets are generated (one per Mailchimp campaign).
  */
 
 const fs = require('fs');
 const path = require('path');
 const papa = require('papaparse');
+const readline = require('readline');
 
 // ============================================================
-// CONFIGURATION
+// CONFIGURATION (default values, will be overridden)
 // ============================================================
 const CONFIG = {
   dataCenter: 'us4',
-  campaignId: '13360607',  // from MailChimp Campaign URL directly
+  campaignId: '13360698',  // default; overridden by prompt at runtime
   // extract from any request, only change if it is not working
   csrfToken:  '68482a96133502c049642899504e06ecaba10dc4',
 
-  month: 'May',  // change this
+  month: '',  // will prompt user
   year:  '2026',
   csvFile: './submissions.csv',  // prepare submissions export in this file
 
@@ -74,6 +77,19 @@ function parseCSV(filePath) {
 let _nodeId = 200;
 const nextId = () => _nodeId++;
 const uid    = () => Array.from({ length: 32 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+
+// Mailchimp keys editor blocks by uniqueId; regenerate for every generated email.
+function assignFreshUniqueIds(value) {
+  if (value === null || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    value.forEach(assignFreshUniqueIds);
+    return;
+  }
+  if (typeof value.uniqueId === 'string') {
+    value.uniqueId = uid();
+  }
+  Object.values(value).forEach(assignFreshUniqueIds);
+}
 
 const PARA_ATTRS = (extra = {}) => ({
   fontFamily: null, preventHardLineBreaks: false, fontSize: null,
@@ -222,7 +238,11 @@ function buildEventSection(event) {
 // ============================================================
 // STATIC BASE NODES
 // ============================================================
-function buildBaseNodes(month, year, row33Children) {
+function buildBaseNodes(month, year, row33Children, { partIndex = 1, partTotal = 1 } = {}) {
+  const newsletterTitle = partTotal > 1
+    ? `Monthly e-Newsletter (${month} ${year}) - Part ${partIndex}`
+    : `Monthly e-Newsletter (${month} ${year})`;
+
   return {
     48: {
       type: 'IMAGE', uniqueId: '9711a41113921b496c581b7894babc7f',
@@ -276,7 +296,7 @@ function buildBaseNodes(month, year, row33Children) {
             {
               type: 'heading',
               attrs: { level: 3, lineHeight: null, textAlign: null, textDirection: null, fontWeight: null, fontStyle: null, fontFamily: null, fontSize: null, style: null, class: 'mcePastedContent', id: null, letterSpacing: null },
-              content: [{ type: 'text', text: `Monthly e-Newsletter (${month} ${year})` }]
+              content: [{ type: 'text', text: newsletterTitle }]
             },
             emptyPara(),
             {
@@ -460,7 +480,8 @@ function buildBaseNodes(month, year, row33Children) {
 // ============================================================
 // BUILD FULL DOCUMENT
 // ============================================================
-function buildDocument(events) {
+function buildDocument(events, { partIndex = 1, partTotal = 1 } = {}) {
+  _nodeId = 200;
   const { eventNodes, sectionIds } = events.reduce(
     (acc, event) => {
       const { nodes, sectionId } = buildEventSection(event);
@@ -470,15 +491,36 @@ function buildDocument(events) {
   );
 
   const row33Children = [5, ...sectionIds, 50, 30, 31];
-  const baseNodes     = buildBaseNodes(CONFIG.month, CONFIG.year, row33Children);
+  const baseNodes     = buildBaseNodes(CONFIG.month, CONFIG.year, row33Children, { partIndex, partTotal });
 
-  return { docId: 1, document: { ...baseNodes, ...eventNodes } };
+  const docBody = { docId: 1, document: { ...baseNodes, ...eventNodes } };
+  assignFreshUniqueIds(docBody);
+  return docBody;
+}
+
+// Split events into N chunks; remainder entries go to the first email.
+function splitEventsIntoChunks(events, parts) {
+  const n = events.length;
+  const k = parts;
+  const base = Math.floor(n / k);
+  const remainder = n % k;
+  const sizes = Array.from({ length: k }, (_, i) => (i === 0 ? base + remainder : base));
+
+  const chunks = [];
+  let offset = 0;
+  for (const size of sizes) {
+    chunks.push(events.slice(offset, offset + size));
+    offset += size;
+  }
+  return { chunks, sizes };
 }
 
 // ============================================================
 // GENERATE FETCH SNIPPET
 // ============================================================
-function generateFetchSnippet(docBody) {
+function generateFetchSnippet(docBody, { campaignId, partIndex = 1, partTotal = 1 } = {}) {
+  const cid = campaignId ?? CONFIG.campaignId;
+  const partLabel = partTotal > 1 ? ` (Part ${partIndex} of ${partTotal})` : '';
   const payload = JSON.stringify({
     ...docBody,
     html:        '',
@@ -494,12 +536,12 @@ function generateFetchSnippet(docBody) {
     .replace(/\$\{/g, '\\${');
 
   return `// =====================================================
-// JCI HK Newsletter — ${CONFIG.month} ${CONFIG.year}
+// JCI HK Newsletter — ${CONFIG.month} ${CONFIG.year}${partLabel}
 // Paste this into the browser console while on:
-// https://${CONFIG.dataCenter}.admin.mailchimp.com/email/editor?id=${CONFIG.campaignId}
+// https://${CONFIG.dataCenter}.admin.mailchimp.com/email/editor?id=${cid}
 // =====================================================
 
-fetch("https://${CONFIG.dataCenter}.admin.mailchimp.com/email/editor/edit?id=${CONFIG.campaignId}", {
+fetch("https://${CONFIG.dataCenter}.admin.mailchimp.com/email/editor/edit?id=${cid}", {
   method: "POST",
   mode: "cors",
   credentials: "include",
@@ -632,10 +674,70 @@ async function downloadVisuals(events, outputFile) {
 // ============================================================
 // MAIN
 // ============================================================
+async function prompt(question) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  return new Promise(resolve => {
+    rl.question(question, answer => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
 async function main() {
   console.log('📧  JCI HK Newsletter Generator');
-  console.log(`    ${CONFIG.month} ${CONFIG.year}\n`);
+  // Prompt for month
+  let monthPrompt = await prompt(`Enter the month for the newsletter (e.g., June): `);
+  monthPrompt = monthPrompt.trim();
+  if (!monthPrompt) {
+    console.log('❌  Month not entered.');
+    process.exit(1);
+  }
+  CONFIG.month = monthPrompt;
 
+  // Prompt for email split count
+  let splitPrompt = await prompt(`Split into how many emails? [1]: `);
+  splitPrompt = splitPrompt.trim();
+  let splitCount = splitPrompt ? parseInt(splitPrompt, 10) : 1;
+  if (!Number.isInteger(splitCount) || splitCount < 1) {
+    console.log('❌  Split count must be a positive integer.');
+    process.exit(1);
+  }
+
+  // Prompt for Mailchimp campaign ID(s)
+  const campaignIds = [];
+  if (splitCount === 1) {
+    let campaignIdPrompt = await prompt(
+      `Enter Mailchimp campaign ID (from editor URL, e.g. .../editor?id=13360698) [${CONFIG.campaignId}]: `
+    );
+    campaignIdPrompt = campaignIdPrompt.trim();
+    campaignIds.push(campaignIdPrompt || CONFIG.campaignId);
+  } else {
+    for (let i = 1; i <= splitCount; i++) {
+      let campaignIdPrompt = await prompt(
+        `Enter Mailchimp campaign ID for email ${i} of ${splitCount}: `
+      );
+      campaignIdPrompt = campaignIdPrompt.trim();
+      if (!campaignIdPrompt) {
+        console.log(`❌  Campaign ID not entered for email ${i}.`);
+        process.exit(1);
+      }
+      campaignIds.push(campaignIdPrompt);
+    }
+  }
+
+  // Prompt for download photos?
+  let needPhotoInput = await prompt(`Do you want to download event photos? [Y/n]: `);
+  needPhotoInput = needPhotoInput.trim().toLowerCase();
+  let needDownloadVisuals = true;
+  if (needPhotoInput === 'n' || needPhotoInput === 'no') {
+    needDownloadVisuals = false;
+  }
+
+  console.log(`    ${CONFIG.month} ${CONFIG.year}\n`);
   if (!fs.existsSync(CONFIG.csvFile)) {
     console.error(`❌  CSV not found: ${CONFIG.csvFile}`);
     process.exit(1);
@@ -647,22 +749,72 @@ async function main() {
     console.log(`    ${i + 1}. [${e.chapter}] ${e.name}${e.cta_link ? ' 🔗' : ''}`)
   );
 
-  const docBody  = buildDocument(events);
-  const snippet  = generateFetchSnippet(docBody);
-  const outFile  = `./newsletter-${CONFIG.month.toLowerCase()}-${CONFIG.year}.js`;
+  const { chunks, sizes } = splitEventsIntoChunks(events, splitCount);
+  const outFiles = [];
 
-  fs.writeFileSync(outFile, snippet, 'utf-8');
-  const { visualsDir, downloadedCount } = await downloadVisuals(events, outFile);
+  if (splitCount > 1) {
+    console.log(`\n✅  Split into ${splitCount} email(s):`);
+    let globalIndex = 0;
+    chunks.forEach((chunk, i) => {
+      console.log(`    Email ${i + 1} (campaign ${campaignIds[i]}) — ${sizes[i]} event(s):`);
+      chunk.forEach((e) => {
+        globalIndex++;
+        console.log(`        ${globalIndex}. [${e.chapter}] ${e.name}${e.cta_link ? ' 🔗' : ''}`);
+      });
+      if (chunk.length === 0) {
+        console.log('        (no events)');
+      }
+    });
+  }
 
-  console.log(`\n✅  Fetch snippet saved → ${outFile}`);
-  console.log(`✅  Downloaded ${downloadedCount} visual(s) → ${visualsDir}`);
+  const baseOutFile = `./newsletter-${CONFIG.month.toLowerCase()}-${CONFIG.year}`;
+
+  for (let i = 0; i < splitCount; i++) {
+    const chunk = chunks[i];
+    const docBody = buildDocument(chunk, { partIndex: i + 1, partTotal: splitCount });
+    const snippet = generateFetchSnippet(docBody, {
+      campaignId: campaignIds[i],
+      partIndex: i + 1,
+      partTotal: splitCount,
+    });
+    const outFile = splitCount === 1
+      ? `${baseOutFile}.js`
+      : `${baseOutFile}-part${i + 1}.js`;
+    fs.writeFileSync(outFile, snippet, 'utf-8');
+    outFiles.push({ outFile, campaignId: campaignIds[i], partIndex: i + 1, eventCount: chunk.length });
+  }
+
+  let downloadedCount = 0;
+  let visualsDir = '';
+  if (needDownloadVisuals) {
+    const visualsOutFile = outFiles[0].outFile;
+    const result = await downloadVisuals(events, visualsOutFile);
+    visualsDir = result.visualsDir;
+    downloadedCount = result.downloadedCount;
+    console.log(`✅  Downloaded ${downloadedCount} visual(s) → ${visualsDir}`);
+  } else {
+    console.log(`ℹ️  Skipped downloading visuals as per user selection.`);
+  }
+
+  console.log(`\n✅  Fetch snippet${outFiles.length > 1 ? 's' : ''} saved:`);
+  outFiles.forEach(({ outFile, campaignId, partIndex, eventCount }) => {
+    const partNote = splitCount > 1 ? ` (email ${partIndex}, ${eventCount} event(s))` : '';
+    console.log(`    → ${outFile}${partNote} — campaign ${campaignId}`);
+  });
+
   console.log('\n📋  Next steps:');
-  console.log(`    1. Open https://${CONFIG.dataCenter}.admin.mailchimp.com/email/editor?id=${CONFIG.campaignId}`);
+  console.log(`    1. Open https://${CONFIG.dataCenter}.admin.mailchimp.com — ensure you are logged in`);
   console.log('    2. Open DevTools → Console tab');
-  console.log(`    3. Copy & paste the contents of ${outFile}`);
-  console.log('    4. Hit Enter — watch for ✅ Success in console');
-  console.log('    5. Click Save in the editor to regenerate HTML');
-  console.log('    6. Replace image placeholders for each event');
+  if (outFiles.length === 1) {
+    console.log(`    3. Copy & paste the contents of ${outFiles[0].outFile} into the console, then hit Enter`);
+  } else {
+    console.log('    3. For each file below, copy & paste into the console and hit Enter:');
+    outFiles.forEach(({ outFile, campaignId, partIndex }) => {
+      console.log(`        • ${outFile} (email ${partIndex}, campaign ${campaignId})`);
+    });
+  }
+  console.log('    4. Open each email editor, review, then click Save to regenerate HTML');
+  console.log('    5. Replace image placeholders manually for each event');
 }
 
 main().catch((error) => {
