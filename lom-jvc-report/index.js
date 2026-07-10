@@ -35,20 +35,81 @@ function omitSheetJsEmptyColumns(row) {
   return _.omitBy(row, (_value, key) => /^__EMPTY(_\d+)?$/.test(key));
 }
 
+function readTextFile(filePath, label) {
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    throw new Error(`Cannot read ${label}: ${filePath} (${err.message})`);
+  }
+}
+
+function assertRequiredColumns(rows, requiredColumns, label, filePath) {
+  if (!rows.length) {
+    throw new Error(`${label} is empty: ${filePath}`);
+  }
+
+  const keys = new Set(Object.keys(rows[0]));
+  const missing = requiredColumns.filter((col) => !keys.has(col));
+  if (missing.length) {
+    throw new Error(
+      `${label} is missing required column(s): ${missing.join(', ')} (${filePath})`
+    );
+  }
+}
+
 function readJvcXlsx(filePath) {
-  const workbook = XLSX.readFile(filePath);
+  let workbook;
+  try {
+    workbook = XLSX.readFile(filePath);
+  } catch (err) {
+    throw new Error(`Cannot open JVC file: ${filePath} (${err.message})`);
+  }
+
+  if (!workbook.SheetNames.length) {
+    throw new Error(`JVC file has no worksheets: ${filePath}`);
+  }
+
   const sheetName = workbook.SheetNames[0];
   const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
-  return rows.map(omitSheetJsEmptyColumns);
+  const normalizedRows = rows.map(omitSheetJsEmptyColumns);
+
+  assertRequiredColumns(
+    normalizedRows,
+    ['Email', 'Organization Name', 'Member Type', 'User ID'],
+    'JVC file',
+    filePath
+  );
+
+  return normalizedRows;
+}
+
+function normalizeMaRow(row) {
+  const normalized = {};
+  for (const [key, value] of Object.entries(row)) {
+    normalized[key.trim()] = value;
+  }
+  return normalized;
 }
 
 function readMaCsv(filePath) {
-  const content = fs.readFileSync(filePath, 'utf8');
+  const content = readTextFile(filePath, 'MA file');
+
+  if (/^\x50\x4B/.test(content.slice(0, 2)) || content.startsWith('PK')) {
+    throw new Error(
+      `Cannot open MA file as CSV (file looks like Excel): ${filePath}`
+    );
+  }
+
   const parsed = Papa.parse(content, { header: true, skipEmptyLines: true });
   if (parsed.errors.length) {
-    console.warn('CSV parse warnings:', parsed.errors.slice(0, 3));
+    const detail = parsed.errors.map((error) => error.message).join('; ');
+    throw new Error(`Cannot parse MA CSV: ${filePath} (${detail})`);
   }
-  return parsed.data;
+
+  const rows = parsed.data.map(normalizeMaRow);
+  assertRequiredColumns(rows, ['NOM', 'email'], 'MA file', filePath);
+
+  return rows;
 }
 
 function writeXlsx(filePath, rows, sheetName = 'Sheet1') {
@@ -58,14 +119,56 @@ function writeXlsx(filePath, rows, sheetName = 'Sheet1') {
   XLSX.writeFile(workbook, filePath);
 }
 
-function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
+function isJvcGuest(jvcRow) {
+  return String(jvcRow?.['Member Type'] ?? '').trim().toLowerCase() === 'guest';
+}
+
+function buildJvcEmailToRow(jvcRows) {
   const jvcEmailToRow = {};
   for (const jvcRow of jvcRows) {
     const jvcEmail = normalizeEmail(jvcRow.Email);
-    if (jvcEmail && !jvcEmailToRow[jvcEmail]) {
+    if (!jvcEmail) continue;
+
+    const existing = jvcEmailToRow[jvcEmail];
+    if (!existing || (isJvcGuest(existing) && !isJvcGuest(jvcRow))) {
       jvcEmailToRow[jvcEmail] = jvcRow;
     }
   }
+  return jvcEmailToRow;
+}
+
+function matchMaMemberToJvc(candidates, jvcEmailToRow, consumedJvcEmails) {
+  let guestMatch = null;
+  let guestEmail = null;
+
+  for (const candidate of candidates) {
+    if (consumedJvcEmails.has(candidate)) continue;
+
+    const jvcRow = jvcEmailToRow[candidate];
+    if (!jvcRow) continue;
+
+    if (isJvcGuest(jvcRow)) {
+      if (!guestMatch) {
+        guestMatch = jvcRow;
+        guestEmail = candidate;
+      }
+      continue;
+    }
+
+    consumedJvcEmails.add(candidate);
+    return { jvcRow, isGuest: false };
+  }
+
+  if (guestMatch) {
+    consumedJvcEmails.add(guestEmail);
+    return { jvcRow: guestMatch, isGuest: true };
+  }
+
+  return null;
+}
+
+function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
+  const jvcEmailToRow = buildJvcEmailToRow(jvcRows);
   const consumedJvcEmails = new Set();
 
   const tableRows = maRows.map((row) => {
@@ -73,14 +176,9 @@ function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
     const email2 = normalizeEmail(row['email 2 ( backup )']);
     const candidates = [email, email2].filter(Boolean);
 
-    let matchedJvcRow = null;
-    for (const candidate of candidates) {
-      if (jvcEmailToRow[candidate] && !consumedJvcEmails.has(candidate)) {
-        matchedJvcRow = jvcEmailToRow[candidate];
-        consumedJvcEmails.add(candidate);
-        break;
-      }
-    }
+    const match = matchMaMemberToJvc(candidates, jvcEmailToRow, consumedJvcEmails);
+    const matchedJvcRow = match?.jvcRow ?? null;
+    const isGuestMatch = Boolean(match?.isGuest);
 
     return {
       LOM: row.NOM || lomName,
@@ -90,31 +188,39 @@ function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
       Email: row.email,
       'Email 2': row['email 2 ( backup )'],
       'JVC Account Matched': matchedJvcRow ? 'Yes' : 'No',
+      'Status': !matchedJvcRow
+        ? 'No'
+        : isGuestMatch
+          ? 'Not OK, account is Guest'
+          : 'OK',
       'JVC Account Email': matchedJvcRow?.Email ?? '',
       'JVC User ID': matchedJvcRow ? String(matchedJvcRow['User ID'] ?? '').trim() : '',
-      _matched: Boolean(matchedJvcRow),
+      _accountMatched: Boolean(matchedJvcRow),
+      _accountOk: Boolean(matchedJvcRow && !isGuestMatch),
     };
   });
 
   const memCount = tableRows.length;
-  const jvcMatchCount = _.sumBy(tableRows, (row) => (row._matched ? 1 : 0));
+  const jvcMatchCount = _.sumBy(tableRows, (row) => (row._accountMatched ? 1 : 0));
+  const jvcOkCount = _.sumBy(tableRows, (row) => (row._accountOk ? 1 : 0));
   const percentage =
-    memCount === 0 ? 0 : _.round((jvcMatchCount / memCount) * 100, 1);
+    memCount === 0 ? 0 : _.round((jvcOkCount / memCount) * 100, 1);
 
-  const summary = `JVC Account Report as of ${dateStamp} | Members: ${memCount} | JVC Accounts Matched: ${jvcMatchCount} | Percentage: ${percentage}%`;
+  const summary = `JVC Account Report as of ${dateStamp} | Members: ${memCount} | JVC Accounts Matched: ${jvcMatchCount} | JVC Accounts OK: ${jvcOkCount} | OK Percentage: ${percentage}%`;
 
-  const exportRows = tableRows.map(({ _matched, ...rest }) => rest);
-  const headerKeys = Object.keys(exportRows[0] || {
-    LOM: '',
-    'Member Type': '',
-    'First Name': '',
-    'Last Name': '',
-    Email: '',
-    'Email 2': '',
-    'JVC Account Matched': '',
-    'JVC Account Email': '',
-    'JVC User ID': '',
-  });
+  const exportRows = tableRows.map(({ _accountMatched, _accountOk, ...rest }) => rest);
+  const headerKeys = [
+    'LOM',
+    'Member Type',
+    'First Name',
+    'Last Name',
+    'Email',
+    'Email 2',
+    'JVC Account Matched',
+    'Status',
+    'JVC Account Email',
+    'JVC User ID',
+  ];
 
   const aoa = [
     [summary],
@@ -127,7 +233,7 @@ function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
   XLSX.utils.book_append_sheet(workbook, worksheet, 'JVC Account Report');
   XLSX.writeFile(workbook, filePath);
 
-  return { memCount, jvcMatchCount, percentage, tableRows };
+  return { memCount, jvcMatchCount, jvcOkCount, percentage, tableRows };
 }
 
 const LOM_FILE_NAME_MAP = {
@@ -200,8 +306,20 @@ function generatePassword() {
 }
 
 function protectXlsx(inputPath, outputPath, password) {
-  const input = fs.readFileSync(inputPath);
-  const output = officeCrypto.encrypt(input, { password });
+  let input;
+  try {
+    input = fs.readFileSync(inputPath);
+  } catch (err) {
+    throw new Error(`Cannot open file for password protection: ${inputPath} (${err.message})`);
+  }
+
+  let output;
+  try {
+    output = officeCrypto.encrypt(input, { password });
+  } catch (err) {
+    throw new Error(`Cannot password-protect file: ${inputPath} (${err.message})`);
+  }
+
   fs.writeFileSync(outputPath, output);
 }
 
@@ -209,13 +327,23 @@ function readLomRepEmails(filePath) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`LOM rep email file not found: ${filePath}`);
   }
-  const content = fs.readFileSync(filePath, 'utf8');
+
+  const content = readTextFile(filePath, 'LOM rep email file');
   const lines = content.split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) {
+    throw new Error(`LOM rep email file is empty: ${filePath}`);
+  }
+
   const map = {};
   for (const line of lines) {
     const [lom, email] = line.split(',').map((part) => part.trim());
     if (lom && email) map[lom] = email;
   }
+
+  if (!Object.keys(map).length) {
+    throw new Error(`LOM rep email file has no valid entries: ${filePath}`);
+  }
+
   return map;
 }
 
@@ -383,8 +511,14 @@ async function main() {
 
     console.log('\nReading files...');
     const jvcRowsAll = readJvcXlsx(jvcPath);
-    const jvcRows = jvcRowsAll.filter((row) => isJciLomName(row['Organization Name']));
     const maRows = readMaCsv(maPath);
+    const jvcRows = jvcRowsAll.filter((row) => isJciLomName(row['Organization Name']));
+
+    if (!jvcRows.length) {
+      throw new Error(
+        `JVC file has no rows with Organization Name matching "JCI XXXXX": ${jvcPath}`
+      );
+    }
 
     const groupedJvc = _.groupBy(jvcRows, (row) => row['Organization Name'].trim());
     const groupedMa = _.groupBy(maRows, (row) => row.NOM || 'Unknown');
