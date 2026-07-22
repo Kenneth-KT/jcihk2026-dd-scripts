@@ -112,15 +112,59 @@ function readMaCsv(filePath) {
   return rows;
 }
 
-function writeXlsx(filePath, rows, sheetName = 'Sheet1') {
-  const worksheet = XLSX.utils.json_to_sheet(rows);
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
-  XLSX.writeFile(workbook, filePath);
+function applyWideColumns(worksheet, { min = 14, max = 56, padding = 3, startRow } = {}) {
+  if (!worksheet['!ref']) return;
+
+  const range = XLSX.utils.decode_range(worksheet['!ref']);
+  const firstRow = startRow == null ? range.s.r : startRow;
+  const cols = [];
+  for (let C = range.s.c; C <= range.e.c; C++) {
+    let width = min;
+    for (let R = firstRow; R <= range.e.r; R++) {
+      const cell = worksheet[XLSX.utils.encode_cell({ r: R, c: C })];
+      if (cell == null || cell.v == null) continue;
+      const len = String(cell.v).length + padding;
+      if (len > width) width = Math.min(max, len);
+    }
+    cols.push({ wch: width });
+  }
+  worksheet['!cols'] = cols;
 }
+
+/** Copy column width from one header to another (e.g. LOM ← Email). */
+function syncColumnWidthByHeader(worksheet, headerRowIndex, fromHeader, toHeader, { scale = 1 } = {}) {
+  if (!worksheet['!cols'] || !worksheet['!ref']) return;
+
+  const range = XLSX.utils.decode_range(worksheet['!ref']);
+  let fromIdx = -1;
+  let toIdx = -1;
+  for (let C = range.s.c; C <= range.e.c; C++) {
+    const header = worksheet[XLSX.utils.encode_cell({ r: headerRowIndex, c: C })]?.v;
+    if (header === fromHeader) fromIdx = C;
+    if (header === toHeader) toIdx = C;
+  }
+  if (fromIdx < 0 || toIdx < 0 || !worksheet['!cols'][fromIdx]) return;
+  const source = worksheet['!cols'][fromIdx];
+  const wch = Math.max(8, Math.round((source.wch ?? 14) * scale));
+  worksheet['!cols'][toIdx] = { ...source, wch };
+}
+
+function jsonToWideSheet(rows) {
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  applyWideColumns(worksheet);
+  syncColumnWidthByHeader(worksheet, 0, 'Email', 'LOM', { scale: 0.5 });
+  syncColumnWidthByHeader(worksheet, 0, 'email', 'LOM', { scale: 0.5 });
+  return worksheet;
+}
+
+const ACCOUNT_MEMBER_TYPES = new Set(['full', 'prospective', 'senior']);
 
 function isJvcGuest(jvcRow) {
   return String(jvcRow?.['Member Type'] ?? '').trim().toLowerCase() === 'guest';
+}
+
+function isAccountMemberType(maRow) {
+  return ACCOUNT_MEMBER_TYPES.has(String(maRow?.['NOM Member Type'] ?? '').trim().toLowerCase());
 }
 
 function buildJvcEmailToRow(jvcRows) {
@@ -167,11 +211,49 @@ function matchMaMemberToJvc(candidates, jvcEmailToRow, consumedJvcEmails) {
   return null;
 }
 
-function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
+/** Find email on a JVC row whose Organization Name is not this LOM. */
+function findWrongChapterJvcMatch(candidates, lomName, allJvcEmailToRows) {
+  for (const candidate of candidates) {
+    const rows = allJvcEmailToRows[candidate] || [];
+    for (const jvcRow of rows) {
+      const org = String(jvcRow['Organization Name'] ?? '').trim();
+      if (org && org !== lomName) {
+        return { jvcRow, email: candidate };
+      }
+    }
+  }
+  return null;
+}
+
+function buildJvcEmailToRows(jvcRows) {
+  const jvcEmailToRows = {};
+  for (const jvcRow of jvcRows) {
+    const jvcEmail = normalizeEmail(jvcRow.Email);
+    if (!jvcEmail) continue;
+    if (!jvcEmailToRows[jvcEmail]) jvcEmailToRows[jvcEmail] = [];
+    jvcEmailToRows[jvcEmail].push(jvcRow);
+  }
+  return jvcEmailToRows;
+}
+
+function formatWrongChapterRemark(wrongChapterMatch) {
+  if (!wrongChapterMatch) return '';
+
+  const org = String(wrongChapterMatch.jvcRow['Organization Name'] ?? '').trim();
+  const userId = String(wrongChapterMatch.jvcRow['User ID'] ?? '').trim();
+  const email = wrongChapterMatch.jvcRow.Email || wrongChapterMatch.email;
+  const parts = [`JVC account email found under wrong chapter: ${org}`];
+  if (email) parts.push(`email ${email}`);
+  if (userId) parts.push(`User ID ${userId}`);
+  return parts.join(' | ');
+}
+
+function buildAccountReportSheet(lomName, maRows, jvcRows, allJvcEmailToRows, dateStamp) {
+  const accountMaRows = maRows.filter(isAccountMemberType);
   const jvcEmailToRow = buildJvcEmailToRow(jvcRows);
   const consumedJvcEmails = new Set();
 
-  const tableRows = maRows.map((row) => {
+  const tableRows = accountMaRows.map((row) => {
     const email = normalizeEmail(row.email);
     const email2 = normalizeEmail(row['email 2 ( backup )']);
     const candidates = [email, email2].filter(Boolean);
@@ -179,6 +261,19 @@ function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
     const match = matchMaMemberToJvc(candidates, jvcEmailToRow, consumedJvcEmails);
     const matchedJvcRow = match?.jvcRow ?? null;
     const isGuestMatch = Boolean(match?.isGuest);
+
+    let remarks = '';
+    if (!matchedJvcRow) {
+      const existsInChapter = candidates.some((candidate) => jvcEmailToRow[candidate]);
+      if (!existsInChapter) {
+        const wrongChapterMatch = findWrongChapterJvcMatch(
+          candidates,
+          lomName,
+          allJvcEmailToRows
+        );
+        remarks = formatWrongChapterRemark(wrongChapterMatch);
+      }
+    }
 
     return {
       LOM: row.NOM || lomName,
@@ -188,13 +283,14 @@ function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
       Email: row.email,
       'Email 2': row['email 2 ( backup )'],
       'JVC Account Matched': matchedJvcRow ? 'Yes' : 'No',
-      'Status': !matchedJvcRow
+      'Validity': !matchedJvcRow
         ? 'No'
         : isGuestMatch
-          ? 'Not OK, account is Guest'
-          : 'OK',
+          ? 'Invalid, Member Type should not be Guest'
+          : 'Valid',
       'JVC Account Email': matchedJvcRow?.Email ?? '',
       'JVC User ID': matchedJvcRow ? String(matchedJvcRow['User ID'] ?? '').trim() : '',
+      Remarks: remarks,
       _accountMatched: Boolean(matchedJvcRow),
       _accountOk: Boolean(matchedJvcRow && !isGuestMatch),
     };
@@ -206,34 +302,155 @@ function writeAccountReportXlsx(filePath, lomName, maRows, jvcRows, dateStamp) {
   const percentage =
     memCount === 0 ? 0 : _.round((jvcOkCount / memCount) * 100, 1);
 
-  const summary = `JVC Account Report as of ${dateStamp} | Members: ${memCount} | JVC Accounts Matched: ${jvcMatchCount} | JVC Accounts OK: ${jvcOkCount} | OK Percentage: ${percentage}%`;
+  const summary = `JVC Account Report as of ${dateStamp} | Members (Full/Prospective/Senior): ${memCount} | JVC Accounts Matched: ${jvcMatchCount} | JVC Accounts Valid: ${jvcOkCount} | Valid Percentage: ${percentage}%`;
 
-  const exportRows = tableRows.map(({ _accountMatched, _accountOk, ...rest }) => rest);
-  const headerKeys = [
-    'LOM',
-    'Member Type',
-    'First Name',
-    'Last Name',
-    'Email',
-    'Email 2',
-    'JVC Account Matched',
-    'Status',
-    'JVC Account Email',
-    'JVC User ID',
-  ];
+  const exportRows = accountMatchingExportRows(tableRows);
+  const headerKeys = ACCOUNT_MATCHING_HEADERS;
 
   const aoa = [
     [summary],
+    [],
     headerKeys,
     ...exportRows.map((row) => headerKeys.map((key) => row[key] ?? '')),
   ];
 
   const worksheet = XLSX.utils.aoa_to_sheet(aoa);
-  const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'JVC Account Report');
-  XLSX.writeFile(workbook, filePath);
+  // Header is on row 3 (0-based index 2); skip summary line so LOM is not inflated.
+  applyWideColumns(worksheet, { min: 14, max: 64, padding: 3, startRow: 2 });
+  syncColumnWidthByHeader(worksheet, 2, 'Email', 'LOM', { scale: 0.5 });
 
-  return { memCount, jvcMatchCount, jvcOkCount, percentage, tableRows };
+  return {
+    worksheet,
+    memCount,
+    jvcMatchCount,
+    jvcOkCount,
+    percentage,
+    tableRows,
+    exportRows,
+  };
+}
+
+function buildMaRecordRows(maRows) {
+  return maRows.filter(isAccountMemberType).map((row) => {
+    const out = {};
+    for (const [key, value] of Object.entries(row)) {
+      out[key === 'NOM' ? 'LOM' : key] = value;
+    }
+    return out;
+  });
+}
+
+const ACCOUNT_MATCHING_HEADERS = [
+  'LOM',
+  'Member Type',
+  'First Name',
+  'Last Name',
+  'Email',
+  'Email 2',
+  'JVC Account Matched',
+  'Validity',
+  'JVC Account Email',
+  'JVC User ID',
+  'Remarks',
+];
+
+function accountMatchingExportRows(tableRows) {
+  return tableRows.map(({ _accountMatched, _accountOk, ...rest }) => rest);
+}
+
+function writeLomCombinedReport(filePath, { jvcRows, maRows, accountSheet }) {
+  const workbook = XLSX.utils.book_new();
+  let sheetCount = 0;
+  const maRecordRows = buildMaRecordRows(maRows);
+
+  if (accountSheet) {
+    XLSX.utils.book_append_sheet(workbook, accountSheet, 'JVC Summary');
+    sheetCount += 1;
+  }
+  if (jvcRows.length) {
+    XLSX.utils.book_append_sheet(workbook, jsonToWideSheet(jvcRows), 'JVC Accounts');
+    sheetCount += 1;
+  }
+  if (maRecordRows.length) {
+    XLSX.utils.book_append_sheet(workbook, jsonToWideSheet(maRecordRows), 'MA Record');
+    sheetCount += 1;
+  }
+
+  if (!sheetCount) return false;
+
+  XLSX.writeFile(workbook, filePath);
+  return true;
+}
+
+function writeAllLomsMasterReport(filePath, { dateStamp, lomSummaries, matchingRows, jvcRows, maRows }) {
+  const workbook = XLSX.utils.book_new();
+
+  const summaryHeaders = [
+    'LOM',
+    'Members (Full/Prospective/Senior)',
+    'JVC Accounts Matched',
+    'JVC Accounts Valid',
+    'Valid Percentage',
+    'JVC Accounts (raw)',
+    'MA Record',
+  ];
+
+  const totalMembers = _.sumBy(lomSummaries, 'memCount');
+  const totalMatched = _.sumBy(lomSummaries, 'jvcMatchCount');
+  const totalValid = _.sumBy(lomSummaries, 'jvcOkCount');
+  const totalJvc = _.sumBy(lomSummaries, 'jvcRawCount');
+  const totalMa = _.sumBy(lomSummaries, 'maRecordCount');
+  const totalPercentage =
+    totalMembers === 0 ? 0 : _.round((totalValid / totalMembers) * 100, 1);
+
+  const summaryAoa = [
+    [`All LOMs JVC Account Summary as of ${dateStamp}`],
+    [],
+    summaryHeaders,
+    ...lomSummaries.map((row) => [
+      row.lomName,
+      row.memCount,
+      row.jvcMatchCount,
+      row.jvcOkCount,
+      `${row.percentage}%`,
+      row.jvcRawCount,
+      row.maRecordCount,
+    ]),
+    [],
+    [
+      'TOTAL',
+      totalMembers,
+      totalMatched,
+      totalValid,
+      `${totalPercentage}%`,
+      totalJvc,
+      totalMa,
+    ],
+  ];
+
+  const summarySheet = XLSX.utils.aoa_to_sheet(summaryAoa);
+  applyWideColumns(summarySheet, { min: 12, max: 40, padding: 2, startRow: 2 });
+  XLSX.utils.book_append_sheet(workbook, summarySheet, 'LOM summaries');
+
+  XLSX.utils.book_append_sheet(
+    workbook,
+    matchingRows.length
+      ? jsonToWideSheet(matchingRows)
+      : jsonToWideSheet([Object.fromEntries(ACCOUNT_MATCHING_HEADERS.map((h) => [h, '']))]),
+    'JVC Account Matching'
+  );
+  XLSX.utils.book_append_sheet(
+    workbook,
+    jvcRows.length ? jsonToWideSheet(jvcRows) : XLSX.utils.aoa_to_sheet([['(no rows)']]),
+    'JVC Accounts'
+  );
+  XLSX.utils.book_append_sheet(
+    workbook,
+    maRows.length ? jsonToWideSheet(maRows) : XLSX.utils.aoa_to_sheet([['(no rows)']]),
+    'MA Record'
+  );
+
+  XLSX.writeFile(workbook, filePath);
 }
 
 const LOM_FILE_NAME_MAP = {
@@ -272,30 +489,68 @@ function exportLomSheets(groupedJvc, groupedMa, dateStamp) {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
   const allLoms = _.union(Object.keys(groupedJvc), Object.keys(groupedMa)).sort();
+  const allJvcRows = allLoms.flatMap((lomName) => groupedJvc[lomName] || []);
+  const allJvcEmailToRows = buildJvcEmailToRows(allJvcRows);
+
+  const lomSummaries = [];
+  const allMatchingRows = [];
+  const allMaRecordRows = [];
 
   for (const lomName of allLoms) {
     const jvcRows = groupedJvc[lomName] || [];
     const maRows = groupedMa[lomName] || [];
+    const maRecordRows = buildMaRecordRows(maRows);
     const base = lomFileBase(lomName);
-
-    const jvcListPath = path.join(OUTPUT_DIR, `${base} JVC list ${dateStamp}.xlsx`);
-    const memberListPath = path.join(OUTPUT_DIR, `${base} Member list ${dateStamp}.xlsx`);
     const reportPath = path.join(OUTPUT_DIR, `${base} JVC Account Report ${dateStamp}.xlsx`);
 
-    if (jvcRows.length) writeXlsx(jvcListPath, jvcRows, 'JVC list');
-    if (maRows.length) writeXlsx(memberListPath, maRows, 'Member list');
+    let accountResult = null;
+    if (maRows.some(isAccountMemberType)) {
+      accountResult = buildAccountReportSheet(
+        lomName,
+        maRows,
+        jvcRows,
+        allJvcEmailToRows,
+        dateStamp
+      );
+    }
 
     const files = {};
-    if (jvcRows.length) files.jvcList = jvcListPath;
-    if (maRows.length) files.memberList = memberListPath;
+    const wrote = writeLomCombinedReport(reportPath, {
+      jvcRows,
+      maRows,
+      accountSheet: accountResult?.worksheet ?? null,
+    });
+    if (wrote) files.report = reportPath;
 
-    if (maRows.length) {
-      writeAccountReportXlsx(reportPath, lomName, maRows, jvcRows, dateStamp);
-      files.accountReport = reportPath;
+    lomSummaries.push({
+      lomName,
+      memCount: accountResult?.memCount ?? 0,
+      jvcMatchCount: accountResult?.jvcMatchCount ?? 0,
+      jvcOkCount: accountResult?.jvcOkCount ?? 0,
+      percentage: accountResult?.percentage ?? 0,
+      jvcRawCount: jvcRows.length,
+      maRecordCount: maRecordRows.length,
+    });
+
+    if (accountResult?.exportRows?.length) {
+      allMatchingRows.push(...accountResult.exportRows);
+    }
+    if (maRecordRows.length) {
+      allMaRecordRows.push(...maRecordRows);
     }
 
     lomData[lomName] = { jvcRows, maRows, files };
   }
+
+  const masterPath = path.join(OUTPUT_DIR, `All LOMs JVC Account Report ${dateStamp}.xlsx`);
+  writeAllLomsMasterReport(masterPath, {
+    dateStamp,
+    lomSummaries,
+    matchingRows: allMatchingRows,
+    jvcRows: allJvcRows,
+    maRows: allMaRecordRows,
+  });
+  console.log(`Master summary (not emailed): ${path.basename(masterPath)}`);
 
   return allLoms;
 }
@@ -433,32 +688,38 @@ async function sendReportEmails(lomRepEmails, selectedLoms) {
     const password = generatePassword();
     data.password = password;
 
-    const attachmentOrder = ['accountReport', 'jvcList', 'memberList'];
-    const attachments = [];
-    for (const key of attachmentOrder) {
-      const filePath = data.files[key];
-      if (!filePath) continue;
+    const reportPath = data.files.report;
+    if (!reportPath) {
+      console.log(`Skipping ${lomName}: no generated report`);
+      continue;
+    }
 
-      const dir = path.dirname(filePath);
-      const ext = path.extname(filePath);
-      const baseName = path.basename(filePath, ext);
-      const protectedPath = path.join(dir, `${baseName} (protected)${ext}`);
-      protectXlsx(filePath, protectedPath, password);
-      attachments.push({
+    const dir = path.dirname(reportPath);
+    const ext = path.extname(reportPath);
+    const baseName = path.basename(reportPath, ext);
+    const protectedPath = path.join(dir, `${baseName} (protected)${ext}`);
+    protectXlsx(reportPath, protectedPath, password);
+    data.files.reportProtected = protectedPath;
+
+    const attachments = [
+      {
         filename: path.basename(protectedPath),
         path: protectedPath,
-      });
-      data.files[`${key}Protected`] = protectedPath;
-    }
+      },
+    ];
 
     const subject = `${lomName} JVC Account Reports`;
     const body = [
       `Dear ${lomName} president and representative(s),`,
       '',
-      `Please find attached the JVC Account Report, JVC member list, and member list from MA System for your chapter as of today (${new Date().toISOString().slice(0, 10)}).`,
- 
+      `Please find attached the JVC Account Report for your chapter as of today (${new Date().toISOString().slice(0, 10)}).`,
       '',
-      `The attached Excel files are password-protected. Use this password to open them: ${password}`,
+      'The Excel file contains three tabs:',
+      '- JVC Summary — account matching report (Full / Prospective / Senior)',
+      '- JVC Accounts — raw JVC member list for your chapter',
+      '- MA Record — MA member list (Full / Prospective / Senior)',
+      '',
+      `The attached Excel file is password-protected. Use this password to open it: ${password}`,
       '',
       'Best regards,',
       'Kenneth Law',
