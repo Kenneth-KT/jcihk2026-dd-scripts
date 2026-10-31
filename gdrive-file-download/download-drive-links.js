@@ -2,7 +2,6 @@
 
 const fs = require("node:fs/promises");
 const path = require("node:path");
-const readline = require("node:readline/promises");
 
 function printUsage() {
   console.log("Usage:");
@@ -153,11 +152,140 @@ async function downloadDriveFile(fileId, outputDir, index) {
   };
 }
 
-function parseLinksArg(rawArg) {
-  return rawArg
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
+async function runWithConcurrency(items, concurrency, worker) {
+  let nextIndex = 0;
+  const results = new Array(items.length);
+
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
+const DRIVE_URL_PREFIXES = [
+  "https://drive.google.com/open?id=",
+  "http://drive.google.com/open?id=",
+  "https://drive.google.com/file/d/",
+  "http://drive.google.com/file/d/",
+  "https://drive.google.com/uc?export=download&id=",
+  "http://drive.google.com/uc?export=download&id=",
+  "https://drive.google.com/uc?id=",
+  "http://drive.google.com/uc?id=",
+];
+
+const DRIVE_FILE_ID_LENGTH = 33;
+
+function matchDriveUrlPrefix(source, start) {
+  const rest = source.slice(start).toLowerCase();
+  for (const prefix of DRIVE_URL_PREFIXES) {
+    if (rest.startsWith(prefix)) {
+      return {
+        prefix: source.slice(start, start + prefix.length),
+        end: start + prefix.length,
+      };
+    }
+  }
+  return null;
+}
+
+function readDriveFileId(source, start) {
+  let end = start;
+  while (end < source.length && /[A-Za-z0-9_-]/.test(source[end])) {
+    end += 1;
+  }
+
+  const greedy = source.slice(start, end);
+  if (greedy.length > DRIVE_FILE_ID_LENGTH) {
+    return {
+      id: greedy.slice(0, DRIVE_FILE_ID_LENGTH),
+      end: start + DRIVE_FILE_ID_LENGTH,
+    };
+  }
+
+  return { id: greedy, end };
+}
+
+function skipDriveUrlSuffix(source, start) {
+  const ch = source[start];
+  if (ch !== "/" && ch !== "?") {
+    return start;
+  }
+
+  let i = start;
+  while (i < source.length && source[i] !== "," && source[i] !== " " && source[i] !== "\t") {
+    i += 1;
+  }
+  return i;
+}
+
+function skipSpaces(source, start) {
+  let i = start;
+  while (i < source.length && (source[i] === " " || source[i] === "\t")) {
+    i += 1;
+  }
+  return i;
+}
+
+function parseInputText(text) {
+  // Terminals insert wrap newlines in bulk paste. Drop them and recover
+  // folder rows from the original separators:
+  //   FOLDER,https://...     (no space after comma)
+  //   , https://...          (space after comma = next file in the same folder)
+  const source = String(text).replace(/[\r\n]/g, "");
+  const records = [];
+  let folder = null;
+  let links = [];
+  let i = 0;
+
+  function flush() {
+    if (links.length > 0) {
+      records.push({ folder, links });
+    }
+    folder = null;
+    links = [];
+  }
+
+  while (i < source.length) {
+    i = skipSpaces(source, i);
+    if (i >= source.length) {
+      break;
+    }
+
+    const prefixMatch = matchDriveUrlPrefix(source, i);
+    if (prefixMatch) {
+      const fileId = readDriveFileId(source, prefixMatch.end);
+      const urlEnd = skipDriveUrlSuffix(source, fileId.end);
+      if (fileId.id) {
+        links.push(prefixMatch.prefix + fileId.id + source.slice(fileId.end, urlEnd));
+      }
+      i = skipSpaces(source, urlEnd);
+      if (source[i] === ",") {
+        i += 1;
+        continue;
+      }
+      flush();
+      continue;
+    }
+
+    const commaAt = source.indexOf(",", i);
+    if (commaAt === -1) {
+      break;
+    }
+
+    flush();
+    folder = source.slice(i, commaAt).trim() || null;
+    i = commaAt + 1;
+  }
+
+  flush();
+  return records.filter((record) => record.links.length > 0);
 }
 
 function readStdin() {
@@ -170,92 +298,160 @@ function readStdin() {
   });
 }
 
-async function readLinksInput() {
+async function readPastedText() {
+  console.log(
+    "Paste comma-separated Google Drive public links, one line will create one folder. \nYou may put the folder name in front of the comma list, files will be put under the folder:",
+  );
+  process.stdout.write("> ");
+
+  return new Promise((resolve, reject) => {
+    process.stdin.setEncoding("utf8");
+    let buffer = "";
+
+    const onData = (chunk) => {
+      buffer += chunk;
+      if (/(?:\r?\n)[ \t]*(?:\r?\n)$/.test(buffer)) {
+        cleanup();
+        resolve(buffer.replace(/(?:\r?\n)[ \t]*(?:\r?\n)+$/, "\n"));
+        return;
+      }
+      // A finished line is not the blank line that starts the download.
+      // Print another prompt so it is obvious the script is still waiting.
+      if (/(?:\r?\n)$/.test(buffer)) {
+        process.stdout.write("> ");
+      }
+    };
+
+    const onEnd = () => {
+      cleanup();
+      resolve(buffer);
+    };
+
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    function cleanup() {
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onError);
+      // A resumed TTY stdin keeps the event loop alive after main() returns.
+      process.stdin.pause();
+      process.stdin.unref();
+    }
+
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+    process.stdin.on("error", onError);
+  });
+}
+
+async function readInputText() {
   if (process.stdin.isTTY) {
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    try {
-      const answer = await rl.question(
-        "Paste comma-separated Google Drive public links, then press Enter:\n> ",
-      );
-      return answer.trim();
-    } finally {
-      rl.close();
+    return readPastedText();
+  }
+
+  return readStdin();
+}
+
+function buildDownloadTasks(records, cliFolder) {
+  const defaultFolderName = cliFolder ? safeDirName(cliFolder) : getTimestampFolderName();
+  const tasks = [];
+
+  for (const parsed of records) {
+    if (!parsed.links.length) {
+      continue;
+    }
+
+    const folderName = parsed.folder ? safeDirName(parsed.folder) : defaultFolderName;
+    const outputDir = path.resolve(process.cwd(), folderName);
+
+    for (let i = 0; i < parsed.links.length; i += 1) {
+      tasks.push({
+        link: parsed.links[i],
+        outputDir,
+        fileIndex: i + 1,
+      });
     }
   }
 
-  return (await readStdin()).trim();
+  return tasks;
 }
 
 async function main() {
   const cli = parseCliArgs(process.argv);
-  const rawInput = cli.links ?? (await readLinksInput());
-  if (!rawInput) {
+  const rawText = cli.links ?? (await readInputText());
+  const records = parseInputText(rawText ?? "");
+
+  if (records.length === 0) {
     console.error("No input received.");
     printUsage();
     process.exitCode = 1;
     return;
   }
 
-  const links = parseLinksArg(rawInput);
-  if (links.length === 0) {
-    console.error("No links found in input.");
-    process.exitCode = 1;
-    return;
-  }
-
-  let folderName;
+  let tasks;
   try {
-    folderName = cli.folder ? safeDirName(cli.folder) : getTimestampFolderName();
+    tasks = buildDownloadTasks(records, cli.folder);
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;
     return;
   }
 
-  const outputDir = path.resolve(process.cwd(), folderName);
-  await fs.mkdir(outputDir, { recursive: true });
+  if (tasks.length === 0) {
+    console.error("No links found in input.");
+    process.exitCode = 1;
+    return;
+  }
 
-  console.log(`Downloading ${links.length} file(s) into: ${outputDir}`);
+  const outputDirs = [...new Set(tasks.map((task) => task.outputDir))];
+  await Promise.all(outputDirs.map((dir) => fs.mkdir(dir, { recursive: true })));
 
-  let successCount = 0;
-  let failCount = 0;
+  console.log("");
+  console.log(`Downloading ${tasks.length} files`);
 
-  for (let i = 0; i < links.length; i += 1) {
-    const link = links[i];
-    const displayIndex = i + 1;
-
+  const results = await runWithConcurrency(tasks, 5, async (task) => {
+    const { link, outputDir, fileIndex } = task;
     const fileId = extractDriveFileId(link);
+
     if (!fileId) {
-      console.error(`[${displayIndex}] Skipped: invalid Google Drive file link -> ${link}`);
-      failCount += 1;
-      continue;
+      console.error(`[${fileIndex}] Skipped: invalid Google Drive file link -> ${link}`);
+      return { success: false };
     }
 
     try {
-      const result = await downloadDriveFile(fileId, outputDir, displayIndex);
+      const result = await downloadDriveFile(fileId, outputDir, fileIndex);
       console.log(
-        `[${displayIndex}] Downloaded: ${result.fileName} (${result.size.toLocaleString()} bytes)`,
+        `[${fileIndex}] Downloaded: ${result.fileName} (${result.size.toLocaleString()} bytes)`,
       );
-      successCount += 1;
+      return { success: true };
     } catch (error) {
-      console.error(`[${displayIndex}] Failed (${fileId}): ${error.message}`);
-      failCount += 1;
+      console.error(`[${fileIndex}] Failed (${fileId}): ${error.message}`);
+      return { success: false };
     }
-  }
+  });
+
+  const successCount = results.filter((result) => result.success).length;
+  const failCount = results.length - successCount;
 
   console.log("");
   console.log(`Completed. Success: ${successCount}, Failed: ${failCount}`);
-  console.log(`Output folder: ${outputDir}`);
+  for (const dir of outputDirs) {
+    console.log(`Output folder: ${dir}`);
+  }
 
   if (failCount > 0) {
     process.exitCode = 2;
   }
 }
 
-main().catch((error) => {
-  console.error("Unexpected error:", error);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("Unexpected error:", error);
+    process.exitCode = 1;
+  });
+} else {
+  module.exports = { parseInputText, extractDriveFileId };
+}
