@@ -4,7 +4,14 @@
  * Outputs a fetch() snippet to paste into your browser console
  *
  * Usage:
- *   node generate-newsletter.js
+ *   node generate-newsletter.js <csv-file> [month] [split] [campaignIds]
+ *   node generate-newsletter.js --help
+ *
+ * With only a CSV file name, the script prompts for month, split count,
+ * campaign ID(s), and whether to download event photos.
+ * Later arguments are optional and skip the matching prompt.
+ * --download-photos / --no-download-photos skips the photo question.
+ *
  *   → Open generated JS file
  *   → Copy contents
  *   → Open Mailchimp editor in browser
@@ -687,54 +694,166 @@ async function prompt(question) {
   });
 }
 
+function printUsage() {
+  console.log(`Usage:
+  node generate-newsletter.js <csv-file> [month] [split] [campaignIds]
+
+Generate a Mailchimp console snippet from an e-newsletter submissions CSV.
+
+Give only <csv-file> to answer the usual prompts (month, split count,
+campaign ID(s), and whether to download event photos).
+Each later argument is optional and skips that prompt.
+
+Arguments:
+  <csv-file>                  Submissions export CSV (required)
+  [month]                     Newsletter month, e.g. June
+  [split]                     How many emails to split into
+  [campaignIds]               Mailchimp campaign IDs as one comma-separated
+                              string, one ID per email. Example: 111,222
+
+Options:
+  --download-photos           Download event photos
+  --no-download-photos        Skip downloading event photos
+  -h, --help                  Show this help
+
+Examples:
+  node generate-newsletter.js submissions.csv
+  node generate-newsletter.js submissions.csv October 1 13360698 --no-download-photos
+  node generate-newsletter.js submissions.csv October 2 111,222 --download-photos
+`);
+}
+
+function parseArgs(argv) {
+  const args = {
+    csvFile: null,
+    month: undefined,
+    split: undefined,
+    campaignIds: undefined,
+    downloadPhotos: undefined,
+    help: false,
+  };
+
+  const positionals = [];
+  const tokens = argv.slice(2);
+  for (const token of tokens) {
+    if (token === '-h' || token === '--help') {
+      args.help = true;
+      continue;
+    }
+    if (token === '--download-photos') {
+      args.downloadPhotos = true;
+      continue;
+    }
+    if (token === '--no-download-photos') {
+      args.downloadPhotos = false;
+      continue;
+    }
+    if (token.startsWith('-')) {
+      console.error(`❌  Unknown option: ${token}\n`);
+      printUsage();
+      process.exit(1);
+    }
+    positionals.push(token);
+  }
+
+  if (positionals.length > 4) {
+    console.error('❌  Campaign IDs must be one comma-separated string, e.g. 111,222\n');
+    printUsage();
+    process.exit(1);
+  }
+
+  if (positionals[0] !== undefined) args.csvFile = positionals[0];
+  if (positionals[1] !== undefined) args.month = positionals[1];
+  if (positionals[2] !== undefined) args.split = positionals[2];
+  if (positionals[3] !== undefined) args.campaignIds = positionals[3];
+
+  return args;
+}
+
+function parseCampaignIdList(value) {
+  return String(value).split(',').map((id) => id.trim()).filter(Boolean);
+}
+
+function requireNonEmpty(value, label) {
+  const trimmed = String(value).trim();
+  if (!trimmed) {
+    console.log(`❌  ${label} not entered.`);
+    process.exit(1);
+  }
+  return trimmed;
+}
+
 async function main() {
+  const args = parseArgs(process.argv);
+  if (args.help) {
+    printUsage();
+    process.exit(0);
+  }
+  if (!args.csvFile) {
+    console.error('❌  CSV file name is required.\n');
+    printUsage();
+    process.exit(1);
+  }
+
+  CONFIG.csvFile = args.csvFile;
+
   console.log('📧  JCI HK Newsletter Generator');
-  // Prompt for month
-  let monthPrompt = await prompt(`Enter the month for the newsletter (e.g., June): `);
-  monthPrompt = monthPrompt.trim();
-  if (!monthPrompt) {
-    console.log('❌  Month not entered.');
-    process.exit(1);
-  }
-  CONFIG.month = monthPrompt;
+  console.log(`    CSV: ${CONFIG.csvFile}`);
 
-  // Prompt for email split count
-  let splitPrompt = await prompt(`Split into how many emails? [1]: `);
-  splitPrompt = splitPrompt.trim();
-  let splitCount = splitPrompt ? parseInt(splitPrompt, 10) : 1;
-  if (!Number.isInteger(splitCount) || splitCount < 1) {
-    console.log('❌  Split count must be a positive integer.');
-    process.exit(1);
-  }
-
-  // Prompt for Mailchimp campaign ID(s)
-  const campaignIds = [];
-  if (splitCount === 1) {
-    let campaignIdPrompt = await prompt(
-      `Enter Mailchimp campaign ID (from editor URL, e.g. .../editor?id=13360698) [${CONFIG.campaignId}]: `
-    );
-    campaignIdPrompt = campaignIdPrompt.trim();
-    campaignIds.push(campaignIdPrompt || CONFIG.campaignId);
+  if (args.month !== undefined) {
+    CONFIG.month = requireNonEmpty(args.month, 'Month');
   } else {
-    for (let i = 1; i <= splitCount; i++) {
-      let campaignIdPrompt = await prompt(
-        `Enter Mailchimp campaign ID for email ${i} of ${splitCount}: `
-      );
-      campaignIdPrompt = campaignIdPrompt.trim();
-      if (!campaignIdPrompt) {
-        console.log(`❌  Campaign ID not entered for email ${i}.`);
-        process.exit(1);
-      }
-      campaignIds.push(campaignIdPrompt);
+    const monthPrompt = (await prompt('Enter the month for the newsletter (e.g., June): ')).trim();
+    if (!monthPrompt) {
+      console.log('❌  Month not entered.');
+      process.exit(1);
+    }
+    CONFIG.month = monthPrompt;
+  }
+
+  let splitCount;
+  if (args.split !== undefined) {
+    splitCount = parseInt(String(args.split).trim(), 10);
+    if (!Number.isInteger(splitCount) || splitCount < 1) {
+      console.log('❌  Split count must be a positive integer.');
+      process.exit(1);
+    }
+  } else {
+    const splitPrompt = (await prompt('Split into how many emails? [1]: ')).trim();
+    splitCount = splitPrompt ? parseInt(splitPrompt, 10) : 1;
+    if (!Number.isInteger(splitCount) || splitCount < 1) {
+      console.log('❌  Split count must be a positive integer.');
+      process.exit(1);
     }
   }
 
-  // Prompt for download photos?
-  let needPhotoInput = await prompt(`Do you want to download event photos? [Y/n]: `);
-  needPhotoInput = needPhotoInput.trim().toLowerCase();
-  let needDownloadVisuals = true;
-  if (needPhotoInput === 'n' || needPhotoInput === 'no') {
-    needDownloadVisuals = false;
+  let campaignIdInput = args.campaignIds;
+  if (campaignIdInput === undefined) {
+    const fallback = splitCount === 1 ? ` [${CONFIG.campaignId}]` : '';
+    campaignIdInput = (await prompt(
+      `Enter Mailchimp campaign ID(s) as a comma-separated string${fallback}: `
+    )).trim();
+    if (!campaignIdInput) {
+      if (splitCount === 1) campaignIdInput = CONFIG.campaignId;
+      else {
+        console.log('❌  Campaign IDs not entered.');
+        process.exit(1);
+      }
+    }
+  }
+
+  const campaignIds = parseCampaignIdList(campaignIdInput);
+  if (campaignIds.length !== splitCount) {
+    console.log(`❌  Expected ${splitCount} comma-separated campaign ID(s), got ${campaignIds.length}.`);
+    process.exit(1);
+  }
+
+  let needDownloadVisuals;
+  if (args.downloadPhotos !== undefined) {
+    needDownloadVisuals = args.downloadPhotos;
+  } else {
+    const needPhotoInput = (await prompt('Do you want to download event photos? [Y/n]: ')).trim().toLowerCase();
+    needDownloadVisuals = !(needPhotoInput === 'n' || needPhotoInput === 'no');
   }
 
   console.log(`    ${CONFIG.month} ${CONFIG.year}\n`);

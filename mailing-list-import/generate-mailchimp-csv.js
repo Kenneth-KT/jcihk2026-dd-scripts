@@ -105,20 +105,53 @@ function getMemberType(record, rowNumber) {
   return nomType;
 }
 
+function printUsage() {
+  const script = path.basename(process.argv[1] || "generate-mailchimp-csv.js");
+  console.error(`Usage: node ${script} <input.csv> <year> [mailchimp.csv] [lom-summary.csv]
+
+Arguments:
+  input.csv         Member export CSV
+  year              4-digit tag year (e.g. 2026)
+  mailchimp.csv     Mailchimp import CSV to write (default: <input>-mailchimp.csv)
+  lom-summary.csv   LOM member-type counts to write (default: <input>-lom-summary.csv)
+`);
+}
+
+function defaultOutputPath(inputPath, suffix) {
+  const dir = path.dirname(inputPath);
+  const base = path.basename(inputPath, path.extname(inputPath));
+  return path.join(dir, `${base}-${suffix}.csv`);
+}
+
 function main() {
-  const inputArg = process.argv[2] || "members.csv";
-  const outputArg = process.argv[3] || "mailchimp.csv";
-  const yearArg = process.argv[4] || process.env.MAILCHIMP_TAG_YEAR || "2026";
-  const summaryArg = process.argv[5] || "lom-summary.csv";
+  const args = process.argv.slice(2);
+
+  if (args.length === 1 && (args[0] === "-h" || args[0] === "--help")) {
+    printUsage();
+    process.exit(0);
+  }
+
+  if (args.length < 2 || args.length > 4) {
+    printUsage();
+    process.exit(1);
+  }
+
+  const [inputArg, yearArg, outputArg, summaryArg] = args;
   const tagYear = String(yearArg).trim();
 
-  const inputPath = path.resolve(process.cwd(), inputArg);
-  const outputPath = path.resolve(process.cwd(), outputArg);
-  const summaryPath = path.resolve(process.cwd(), summaryArg);
-
   if (!/^\d{4}$/.test(tagYear)) {
-    throw new Error(`Invalid tag year "${tagYear}". Expected 4 digits, e.g. 2026`);
+    console.error(`Invalid tag year "${tagYear}". Expected 4 digits, e.g. 2026`);
+    printUsage();
+    process.exit(1);
   }
+
+  const inputPath = path.resolve(process.cwd(), inputArg);
+  const outputPath = outputArg
+    ? path.resolve(process.cwd(), outputArg)
+    : defaultOutputPath(inputPath, "mailchimp");
+  const summaryPath = summaryArg
+    ? path.resolve(process.cwd(), summaryArg)
+    : defaultOutputPath(inputPath, "lom-summary");
 
   if (!fs.existsSync(inputPath)) {
     throw new Error(`Input file not found: ${inputPath}`);
